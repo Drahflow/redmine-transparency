@@ -1,0 +1,90 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use encoding 'utf-8';
+
+use JSON;
+use LWP;
+use LWP::UserAgent;
+use Secrets;
+use Data::Dumper;
+use Digest::SHA qw(sha512_hex);
+use XML::Simple;
+
+# this is just for the really paranoid: hardcode the valid certificates, so rouge CAs don't concern us
+my %goodCerts = (
+  'e0afa607ec8264ab8134043672aa7c2bb617d4160cec998cbf9597ce759b1f9b4fe84c811ac6f2b5fc9590142ee6fe8812a936ce506d5d305d979ec275f15295' => 1,
+  '4edf1edc86fb5a2d25a3e4891a14f7981529ad5052185a7d81d7700d847c2a1d74cee8c8731c1c335b85b8b8dda8b81ad03e1d1754271cbcff647c5b110f9907' => 1,
+  '0b870e54f7bc1405107bfc9e45148c64860630f2f5dfe91d6c0f620e88e9ba3c729a94e07229238abb002052aa4a38ec4faf9a79b4b5062bedc966798d6d7312' => 1,
+);
+
+my $debug = 1;
+my $project = 'https://ticket.piraten-nds.de/projects/rat-bs';
+my $key = Secrets::redmineAPIKey($project);
+my $target = "output";
+
+my $ua = LWP::UserAgent->new;
+$ua->agent("Utilator Redmine Bridge");
+$ua->ssl_opts( SSL_verify_mode => 2 );
+$ua->ssl_opts( SSL_verify_callback => \&verifyCert );
+
+my @issues;
+my @fetchedIssues;
+my $offset = 0;
+do {
+  @fetchedIssues = ();
+
+  my $xml = XMLin(http('GET' => "$project/issues.xml?key=$key&offset=$offset&limit=100"));
+  foreach my $key (keys %{$xml->{'issue'}}) {
+    push @fetchedIssues, {
+      %{$xml->{'issue'}->{$key}},
+      'id' => $key,
+    };
+  }
+  push @issues, @fetchedIssues;
+
+  $offset += $xml->{'limit'};
+} while(@fetchedIssues);
+
+open INDEX, '>:utf8', "$target/index.html" or die "cannot open $target/index.html: $!";
+print INDEX <<"EOHTML";
+<html><meta http-equiv="content-type" content="text/html; charset=UTF-8"><body>
+<table>
+<tr><th>Status</th><th>Seit</th><th>Thema</th></tr>
+EOHTML
+foreach my $issue (sort { $a->{'done_ratio'} <=> $b->{'done_ratio'} } @issues) {
+  print INDEX
+    '<tr>' .
+    '<td>' . $issue->{'done_ratio'} . ' / ' . $issue->{'status'}->{'name'} . '</td>' .
+    '<td>' . $issue->{'start_date'} . '</td>' .
+    '<td><a href="' . $issue->{'id'} . '.html">' . $issue->{'subject'} . '</a></td>' .
+    '</tr>' .
+    "\n";
+}
+print INDEX <<"EOHTML";
+</table></body></html>
+EOHTML
+close INDEX;
+
+sub verifyCert {
+  my $sslLibThinksOk = $_[1];
+
+  my $sha512 = sha512_hex(Net::SSLeay::PEM_get_string_X509($_[4]));
+
+  # warn $sha512;
+  # modify this line depending on how you would like your certificate to be checked
+  return $goodCerts{$sha512} and $sslLibThinksOk;
+}
+
+sub http {
+  my ($method, $url) = @_;
+
+  print "$method $url\n" if $debug;
+
+  my $req = HTTP::Request->new($method => $url);
+  my $res = $ua->request($req);
+  die $res->status_line() . IO::Socket::SSL::errstr() . ' @ ' . $url if(not $res->is_success());
+
+  return $res->content();
+}
